@@ -1,0 +1,418 @@
+---
+title: "Predicting the Presence or Absense of Eels"
+author: "Patty Park"
+---
+
+## Case Study: Eel Distribution Modeling
+
+This project is focused on modeling the eel species Anguilla australis described by Elith et al. (2008). There are two sets of data that I'll be using to Then you'll compare your model's performance to the model used by Elith et al.
+
+```{r, message = FALSE}
+#load libraries
+library(tidyverse)
+library(tidymodels)
+library(xgboost)
+library(janitor)
+library(vip)
+library(gt)
+```
+
+
+## Data
+
+Data is included in this repository. Below is how I read in the data as well as cleaning up the column names. 
+
+*Note*: I am using two datasets, one to create the model and another which is what the paper used. I am essentially comparing my model to the paper's data to see how well my model did against the paper. Most of this will be using one dataset, with the other dataset not being used until the last part of this markdown.
+
+```{r, message = FALSE}
+eel_model <- read_csv(here::here("data", "eel.model.data.csv")) %>% 
+  clean_names() %>% 
+  select(-site) %>% 
+  mutate(angaus = as.factor(angaus),
+         method = as.factor(method))
+
+eel_eval <- read_csv(here::here("data", "eel.eval.data.csv")) %>% 
+    clean_names() %>% 
+  mutate(angaus = as.factor(angaus_obs),
+         method = as.factor(method))
+```
+
+
+### Split and Resample
+
+Here, I am splitting up the model data (eel.model.data.csv) into a training and test set. I'll also be using a 10-fold Cross Validation to resample my training data
+
+
+```{r}
+#set seed for reproducibility
+set.seed(50)
+
+#split data into 80 20 split
+eel_split <- initial_split(eel_model, prop = .8, strata = angaus) #split data stratified by survived
+
+eel_train <- training(eel_split)#get training data
+eel_test = testing(eel_split) #get testing data
+
+#look at first 5 per training and testing data
+#head(eel_train)
+#head(eel_test)
+
+#set folds to 5
+cv_folds = vfold_cv(eel_train, v = 5)
+```
+
+
+### Preprocess
+
+This step is needed to preprocess the data. I'll be using the `recipe` function from the library `recipes`, (can also be found in `tidymodels`) to help preprocess and normalize the data.
+
+
+```{r}
+#create eel recipe
+eel_recipe <- recipe(angaus ~ ., data = eel_train) %>% #create model recipe
+  step_dummy(all_nominal_predictors()) %>% #create dummy variables from all factors
+  step_normalize(all_numeric_predictors()) #normalize all numeric predictors
+```
+
+
+## Tuning XGBoost
+
+For this particular model, I'll be using XGBoost (extreme gradient boosting). The main idea for this is that it builds off of gradient boosting by effectively creating a boosted decision tree that helps create a stronger model. More information can be learned [here](https://www.machinelearningplus.com/machine-learning/an-introduction-to-gradient-boosting-decision-trees/#google_vignette)
+
+### Tune Learning Rate
+
+The first part in creating this model is tuning for the learning rate. Finding the optimal learning rate will help us run the model in a reasonable time. For this first part, we'll tune for just the learning rate.
+
+
+```{r}
+#create model
+eel_xgb_model <- boost_tree(learn_rate = tune()) %>% #tuning the learn_rate and trees for the parameter
+  set_engine("xgboost") %>%  #nthread = 2
+  set_mode("classification")
+
+#create workflow
+eel_xgb_workflow = workflow() %>% #create workflow
+  add_model(eel_xgb_model) %>% #add boosted trees model
+  add_recipe(eel_recipe) #add recipe
+
+#look at workflow
+#eel_xgb_workflow
+```
+
+
+In order for us to find the best learning rate, we need to tune this parameter. Below is how I coded the grid to help us find the best learning rate by iterating over multiple folds. I've also wrapped it around the `system.time` function to let me know how long it take to fun this tuned grid.
+
+
+```{r}
+#create the grid to tune for the learning rate parameter
+grid_1 <- expand.grid(learn_rate = seq(0.0001, 0.3, length.out = 30))
+
+#tune the model using created grid
+system.time(
+  eel_xbg_tune <- eel_xgb_workflow %>%
+    tune_grid(resamples = cv_folds, grid = grid_1)
+)
+
+
+save(eel_xbg_tune, file = "rda/eel_xbg_tune.rda")
+
+#load save rda file
+load(file = here::here("rda", "eel_xbg_tune.rda"))
+
+#view tuned table dataset to see if we have metrics
+eel_xbg_tune
+```
+
+
+Now, let's go ahead and find the best model giving us the optimal learning rate. We can do this by both visualizing the best model performances on a graph and by using the `show_best` function to give us the best model with the best learning rate.
+
+3.  Show the performance of the best models and the estimates for the learning rate parameter values associated with each.
+
+```{r, warning=FALSE}
+#look at performance of model
+autoplot(eel_xbg_tune)
+
+#find the best model from the tuned models
+tree_learn <- show_best(eel_xbg_tune, n = 1)
+
+#print out the best model
+tree_learn %>% 
+  gt() %>% 
+  tab_header(title = "Best model for Learning Rate Parameter")
+
+```
+
+Here, the show_best() function shows that the best metrics is the roc_auc model. Looking at the graph comparing the accuracy and roc_auc models, the roc_auc shows a slightly larger number than the accuracy curve.
+
+
+### Tune Tree Parameters
+
+Now, we are going to tune for the specific tree parameters using the best learning rate we got from the tuned model before. We'll go ahead and create a new model and workflow to help us achieve this.
+
+
+```{r}
+#create a new variable that stores the learning rate
+learn_rate <- tree_learn$learn_rate
+
+#create model setting the learning rate
+eel_xgb_model_learn <- boost_tree(learn_rate = learn_rate, 
+                                  trees = 3000, 
+                                  tree_depth = tune(), 
+                                  min_n = tune(), 
+                                  loss_reduction = tune()) %>% #tuning the learn_rate and trees for the parameter
+  set_engine("xgboost") %>%  #nthread = 2
+  set_mode("classification")
+
+#create the workflow
+eel_xgb_workflow_learn <- workflow() %>% #create workflow
+  add_model(eel_xgb_model_learn) %>% #add boosted trees model
+  add_recipe(eel_recipe)
+
+#look at the workflow
+#eel_xgb_workflow_learn
+```
+
+
+Again, we'll going to set up a tuning grid, but use the `grid_latin_hypercube` to help us tune our grids appropriately to make sure we are sample grid size is being evenly distributed.
+
+
+```{r}
+#set up tuning grid using the `grid_latin_hypercube()`
+
+grid_2 <- grid_latin_hypercube(tree_depth(), min_n(), loss_reduction())
+
+#tune the grid for tree_depth, min_n, and loss_reduction
+system.time(
+  eel_xbg_tune_latin <- eel_xgb_workflow_learn %>%
+    tune_grid(resamples = cv_folds, grid = grid_2)
+)
+
+#save the file
+save(eel_xbg_tune_latin, file = "rda/eel_xbg_tune_latin.rda")
+
+#load save rda file
+load(file = here::here("rda", "eel_xbg_tune_latin.rda"))
+
+#look at tuned model to make sure it has metrics
+eel_xbg_tune_latin
+
+```
+
+
+And again, let's go ahead and graph to visualize our models as well as finding our best model with the most optimal parameters.
+
+
+```{r, warning = FALSE}
+#graph the performance of the tuned model
+autoplot(eel_xbg_tune_latin)
+
+#find the best model for the tree parameters tuned grid
+tree_param_2 <- show_best(eel_xbg_tune_latin, n = 1)
+
+#look at what was the best model
+tree_param_2 %>% 
+  gt() %>% 
+  tab_header(title = "Best Model for Tree Parameters")
+
+#set new variable to have the most optimal parameters
+min_n <- tree_param_2$min_n
+tree_depth <- tree_param_2$tree_depth
+loss_reduction <- tree_param_2$loss_reduction
+```
+
+
+Here, our best model comes from the roc_auc metric. Listed here, our most optimal min_n is 32, most optimal tree_depth is 9, and most optimal loss_reduction is around 0.226.
+
+### Tune Stochastic Parameters
+
+In this section, we'll go ahead and tune for the Stochastic parameters, taking the same steps as the previous sections.
+
+```{r}
+#create model to tune for mtry and sample_size
+eel_xgb_model_stoch <- boost_tree(learn_rate = learn_rate, 
+                                  trees = 3000,
+                                  tree_depth = tree_depth,
+                                  min_n = min_n,
+                                  loss_reduction = loss_reduction,
+                                  mtry = tune(),
+                                  sample_size = tune()) %>% #tuning the learn_rate and trees for the parameter
+  set_engine("xgboost") %>%  #nthread = 2
+  set_mode("classification")
+
+#create workflow
+eel_xgb_workflow_stoch <- workflow() %>% #create workflow
+  add_model(eel_xgb_model_stoch) %>% #add boosted trees model
+  add_recipe(eel_recipe) #add recipe
+
+#look at workflow
+#eel_xgb_workflow_stoch
+
+```
+
+
+
+```{r}
+#create grid for sample_prop() and mtry()
+grid_3 <- grid_latin_hypercube(
+  sample_size = sample_prop(),
+  finalize(mtry(), eel_train)
+)
+
+
+# tune grid from the workflow
+system.time(
+  eel_xbg_tune_stoch <- eel_xgb_workflow_stoch %>%
+    tune_grid(resamples = cv_folds, grid = grid_3)
+)
+
+# look at tuned grid
+eel_xbg_tune_stoch
+```
+
+
+```{r, warning=FALSE}
+#graph the performance of the tuned model
+autoplot(eel_xbg_tune_stoch)
+
+#find best model from the tuned grid
+tree_stoch_3 <- show_best(eel_xbg_tune_stoch, n = 1)
+
+#look at the best model
+tree_stoch_3 %>% 
+  gt() %>% 
+  tab_header(title = "Best Model for Stochastic Parameters")
+
+```
+
+Here, our best model metric is the roc_auc mode. From this model, it states that the most optimal mtry() is 8 while the most optimal sample_size is almost close to 1.
+
+## Finalize workflow and make final prediction
+
+Let's go ahead and finalize our workflow to test our model with the testing data.
+
+```{r, message=FALSE}
+#finalize work flow for our show best model
+rf_final_roc <- finalize_workflow(eel_xgb_workflow_stoch, select_best(eel_xbg_tune_stoch, metric = "roc_auc"))
+
+#fit the finalized workflow
+fit_final_model <- fit(rf_final_roc, eel_train)
+
+set.seed(50)
+# look at the predicted info for training data for final fitted dataset
+test_predict_model <- predict(object = fit_final_model, new_data = eel_test) %>% # predict the training set
+  bind_cols(eel_test)
+#view results
+#test_predict_model
+
+#find metrics of the predicted train data
+test_metrics_model <- test_predict_model %>%
+  metrics(angaus, .pred_class) # get testing data metrics
+#view metrics results
+test_metrics_model %>% 
+  gt() %>% 
+  tab_header(title = "Metrics Results")
+
+#look at sens. and spec.
+sensitivity(test_predict_model, truth = angaus, estimate = .pred_class) %>% 
+  gt()%>% 
+  tab_header(title = "Sensitivity Results")
+specificity(test_predict_model, truth = angaus, estimate = .pred_class) %>% 
+  gt()%>% 
+  tab_header(title = "Specificity Results")
+
+
+m2_model <- test_predict_model %>% 
+  conf_mat(truth = angaus, estimate = .pred_class) %>% #create confusion matrix
+  autoplot(type = "heatmap") + #plot confusion matrix with heatmap
+  theme_bw() + #change theme
+  theme(axis.text.x = element_text(angle = 30, hjust=1)) +
+  #rotate axis labels
+  labs(title = "Boosted Trees for Model data")
+
+m2_model
+```
+
+In this step, we finalized our workflow and analyzed our results. It seemed like my model performed very well, as the estimate from the testing data was very close to the estimates to the training data. In order to see what types of errors my model made, I created a confusion matrix. I can see that there are many true negatives that the model marked. However, there are very few true positives that the model marked. It should also be noted that more false positive have been marked verses the false negatives. 
+When also looking at my sensitivity and specificity, I get a very high sensitivity number and a very low specificity number. Because we get a high sensitivity, we know that our model is better at identifying positive results, meaning that the model is well predicting if there is the presence or absence of a eel in that ecosystem. The low specificity number tells me that the model is incorrectly labeling many of the negative results as positives. However, comparing this to the confusion matrix, I can see that there are not very many that have been labeled as false positives. It is good to note that there were not that many true negatives that were reported in the confusion matrix.
+
+
+## Fit your model the evaluation data and compare performance
+
+After testing our model, let's go ahead and see how well it does with the other dataset provided by the paper.
+
+```{r}
+#set seed for reproducibility
+set.seed(50)
+
+
+#fit final model on the eel_eval data
+fit_final_eval <- fit(rf_final_roc, eel_eval)
+
+
+test_predict_eval <- predict(object = fit_final_eval, new_data = eel_eval) %>% # predict the testing set
+  bind_cols(eel_eval)
+
+```
+
+
+Let's go ahead and analyze our results the same as we did with the previous model.
+
+```{r}
+#find metrics of the predicted train data
+test_metrics_eval <- test_predict_eval %>%
+  metrics(angaus, .pred_class) # get testing data metrics
+#view metrics results
+test_metrics_eval %>% 
+  gt() %>% 
+  tab_header(title = "Metrics Results")
+
+
+m2 <- test_predict_eval %>% 
+  conf_mat(truth = angaus, estimate = .pred_class) %>% #create confusion matrix
+  autoplot(type = "heatmap") + #plot confusion matrix with heatmap
+  theme_bw() + #change theme
+  theme(axis.text.x = element_text(angle = 30, hjust=1)) +
+  #rotate axis labels
+  labs(title = "Boosted Trees")
+
+#show confusion matrix
+m2
+
+
+#look at sens. and spec.
+sensitivity(test_predict_eval, truth = angaus, estimate = .pred_class) %>% 
+  gt() %>% 
+  tab_header(title = "Sensitivity Results")
+specificity(test_predict_eval, truth = angaus, estimate = .pred_class) %>% 
+  gt() %>% 
+  tab_header(title = "Specificity Results")
+```
+
+
+The model performed pretty well on the eval data. For the roc_auc metrics, I get around the same estimate number compared to the other dataset. Looking at the confusion matrix, I see that the majority is true positives and very few are true negatives. 
+Comparing that with the results I get for my sensitivity and specificity, I get a very high sensitivity number, but a very low specificity number. I can interpret this that if the model detects that there was an eel present, then the model accurately labeled the eel being present. However, because of the low specificity, I interpret this as if there was not an eel present in the area, the model will accidentally label it as being present instead.
+
+
+## Conclusion
+
+```{r}
+#visualize to compare the variable importance:
+#for model dataset
+fit_final_model %>% 
+  extract_fit_parsnip() %>% 
+  vip() +
+  theme_bw() +
+  labs(title = "Variable importance on Model dataset")
+
+#for eval dataset
+fit_final_eval %>% 
+  extract_fit_parsnip() %>% 
+  vip() + 
+  theme_bw() +
+  labs(title = "Variable importance on Eval dataset")
+```
+
+
+When looking at the variable importance on both datasets, the most important variables that are the same between the two datasets are `seg_sum_t`, `us_native`, and `ds_max_slope`. After that, the order of variable importance changes between the two datasets. If more of these variable are featured in the area, there is a higher chance that an eel will be present in that area. Another way I interpret the top two important variable is that the summer air temperature and areas with indigenous forest are very important to see if an eel will be found in that area. It is interesting to note that for most of the variables for the model dataset, most of them are of somewhat importance. But in the eval dataset, most of the variable drop down in importance much more significantly. From this, my interpretation is that for the model data, more variables will help detect if there is a eel present or absent, while for the eval data, only a few variable are of importance in order to detect the presence or absence of an eel.
+
+Now comparing it to the Elith et al. paper, I believe my model pretty well against the paper. Comparing what I got for the variable importance to the paper's variable importance, most of my variables got similar numbers to the paper's predictor numbers. Also looking at table 3, it shows that the higher temperatures give much higher marginal effects, which is what I concluded with my own set of data.
